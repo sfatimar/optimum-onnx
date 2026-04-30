@@ -167,6 +167,7 @@ class OpenVINOQuantizer(OptimumQuantizer):
 
         super().__init__()
 
+        self._ort_model_path: Optional[Path] = None
         self.ort_model = self._load_ort_model(ort_model)
         self.seed = seed
         self.trust_remote_code = trust_remote_code
@@ -197,6 +198,7 @@ class OpenVINOQuantizer(OptimumQuantizer):
             model_path = Path(model)
             if not model_path.exists():
                 raise FileNotFoundError(f"Model file not found: {model_path}")
+            self._ort_model_path = model_path
             logger.info(f"Creating ONNX Runtime InferenceSession from {model_path}")
             return onnxruntime.InferenceSession(str(model_path))
         else:
@@ -413,10 +415,10 @@ class OpenVINOQuantizer(OptimumQuantizer):
             nncf_sample = {}
             for key, value in sample.items():
                 if isinstance(value, torch.Tensor):
-                    nccf_sample[key] = value.cpu().numpy()
+                    nncf_sample[key] = value.cpu().numpy()
                 else:
-                    nccf_sample[key] = value
-            nncf_data.append(nccf_sample)
+                    nncf_sample[key] = value
+            nncf_data.append(nncf_sample)
         return nncf_data
 
     def _quantize_with_ov(
@@ -427,7 +429,7 @@ class OpenVINOQuantizer(OptimumQuantizer):
         **kwargs,
     ) -> None:
         """
-        Internal method to perform quantization using optimum-intel OVQuantizer.
+        Internal method to perform ONNX quantization with optimum-intel config objects.
 
         Args:
             ov_config (`OVConfig`):
@@ -440,37 +442,107 @@ class OpenVINOQuantizer(OptimumQuantizer):
                 Additional arguments.
         """
         try:
-            # Log ORT model info
-            logger.info(f"ORT Model Info:")
-            logger.info(f"  Inputs: {list(self.input_names.keys())}")
-            logger.info(f"  Outputs: {list(self.output_names.keys())}")
-
-            # Log quantization config
-            logger.info(f"Using OVQuantizationConfig:")
-            if ov_config.quantization_config:
-                logger.info(f"  Config type: {type(ov_config.quantization_config).__name__}")
-
-            # Save calibration data summary
-            logger.info(f"Calibration data: {len(calibration_data)} samples")
-            if calibration_data:
-                first_sample = calibration_data[0]
-                logger.info(f"  First sample keys: {list(first_sample.keys())}")
-                for key, value in first_sample.items():
-                    if isinstance(value, np.ndarray):
-                        logger.info(f"    {key}: shape={value.shape}, dtype={value.dtype}")
-
-            # The actual quantization would happen here
-            # Since we're bridging ORT with OV, we log the configuration
-            logger.info("Quantization configuration prepared and ready for OpenVINO processing.")
-
-            if save_directory:
-                save_path = Path(save_directory)
-                save_path.mkdir(parents=True, exist_ok=True)
-                logger.info(f"Quantized model will be saved to: {save_path}")
-
+            import onnx
+            import nncf
         except Exception as e:
-            logger.error(f"Error during OpenVINO quantization: {e}")
-            raise
+            raise ImportError(
+                "ONNX quantization requires `onnx` and `nncf` to be installed."
+            ) from e
+
+        if self._ort_model_path is None:
+            raise ValueError(
+                "ONNX output quantization requires a model path. Please initialize OpenVINOQuantizer from a file path."
+            )
+
+        quantization_config = ov_config.quantization_config
+        if quantization_config is None:
+            quantization_config = OVWeightQuantizationConfig(bits=8)
+
+        logger.info("ORT Model Info:")
+        logger.info(f"  Inputs: {list(self.input_names.keys())}")
+        logger.info(f"  Outputs: {list(self.output_names.keys())}")
+        logger.info(f"Using config type: {type(quantization_config).__name__}")
+
+        onnx_model = onnx.load(str(self._ort_model_path))
+        onnx_model = self._materialize_transposed_initializers(onnx_model)
+
+        if isinstance(quantization_config, OVWeightQuantizationConfig):
+            # For weight-only quantization, NNCF can quantize ONNX ModelProto directly.
+            quantized_model = nncf.compress_weights(onnx_model, **quantization_config.to_nncf_dict())
+        elif isinstance(quantization_config, OVQuantizationConfig):
+            if not calibration_data:
+                raise ValueError("Full quantization requires a non-empty calibration dataset.")
+            calibration_dataset = nncf.Dataset(calibration_data)
+            quantized_model = nncf.quantize(
+                onnx_model,
+                calibration_dataset,
+                **quantization_config.to_nncf_dict(),
+            )
+        else:
+            raise TypeError(
+                "Unsupported quantization config for ONNX output: "
+                f"{type(quantization_config)}. Expected OVWeightQuantizationConfig or OVQuantizationConfig."
+            )
+
+        output_dir = Path(save_directory) if save_directory is not None else self._ort_model_path.parent
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        output_name = self._ort_model_path.name
+        output_file = output_dir / output_name
+        onnx.save(quantized_model, str(output_file))
+        logger.info(f"Saved quantized ONNX model to: {output_file}")
+
+    @staticmethod
+    def _materialize_transposed_initializers(onnx_model):
+        """
+        Folds Transpose nodes fed by initializers into new initializer tensors.
+
+        Some ONNX graphs expose MatMul weights via Transpose(initializer) node outputs.
+        NNCF ONNX weight compression expects weight tensors to be initializers, so we
+        materialize such transposes ahead of quantization.
+        """
+        import onnx
+        from onnx import numpy_helper
+
+        init_by_name = {init.name: init for init in onnx_model.graph.initializer}
+        removable_nodes = []
+        new_initializers = []
+
+        for node in onnx_model.graph.node:
+            if node.op_type != "Transpose" or len(node.input) != 1 or len(node.output) != 1:
+                continue
+
+            src_name = node.input[0]
+            dst_name = node.output[0]
+            src_init = init_by_name.get(src_name)
+            if src_init is None:
+                continue
+
+            perm = None
+            for attr in node.attribute:
+                if attr.name == "perm":
+                    perm = list(attr.ints)
+                    break
+
+            src_array = numpy_helper.to_array(src_init)
+            if perm is None:
+                perm = list(reversed(range(src_array.ndim)))
+            dst_array = np.transpose(src_array, axes=perm)
+
+            dst_init = numpy_helper.from_array(dst_array, name=dst_name)
+            new_initializers.append(dst_init)
+            removable_nodes.append(node)
+
+        if new_initializers:
+            onnx_model.graph.initializer.extend(new_initializers)
+            for node in removable_nodes:
+                onnx_model.graph.node.remove(node)
+            logger.info(
+                "Materialized %d Transpose(initializer) nodes into ONNX initializers for quantization.",
+                len(new_initializers),
+            )
+
+        return onnx_model
 
     def get_model_info(self) -> Dict[str, Any]:
         """

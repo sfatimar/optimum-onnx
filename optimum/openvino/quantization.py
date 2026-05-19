@@ -441,14 +441,6 @@ class OpenVINOQuantizer(OptimumQuantizer):
             **kwargs:
                 Additional arguments.
         """
-        try:
-            import onnx
-            import nncf
-        except Exception as e:
-            raise ImportError(
-                "ONNX quantization requires `onnx` and `nncf` to be installed."
-            ) from e
-
         if self._ort_model_path is None:
             raise ValueError(
                 "ONNX output quantization requires a model path. Please initialize OpenVINOQuantizer from a file path."
@@ -463,86 +455,23 @@ class OpenVINOQuantizer(OptimumQuantizer):
         logger.info(f"  Outputs: {list(self.output_names.keys())}")
         logger.info(f"Using config type: {type(quantization_config).__name__}")
 
-        onnx_model = onnx.load(str(self._ort_model_path))
-        onnx_model = self._materialize_transposed_initializers(onnx_model)
+        calibration_dataset = calibration_data
+        if isinstance(quantization_config, OVWeightQuantizationConfig) and quantization_config.bits == 8:
+            # NNCF does not support dataset-aware INT8 weight-only compression.
+            calibration_dataset = None
 
-        if isinstance(quantization_config, OVWeightQuantizationConfig):
-            # For weight-only quantization, NNCF can quantize ONNX ModelProto directly.
-            quantized_model = nncf.compress_weights(onnx_model, **quantization_config.to_nncf_dict())
-        elif isinstance(quantization_config, OVQuantizationConfig):
-            if not calibration_data:
-                raise ValueError("Full quantization requires a non-empty calibration dataset.")
-            calibration_dataset = nncf.Dataset(calibration_data)
-            quantized_model = nncf.quantize(
-                onnx_model,
-                calibration_dataset,
-                **quantization_config.to_nncf_dict(),
-            )
-        else:
-            raise TypeError(
-                "Unsupported quantization config for ONNX output: "
-                f"{type(quantization_config)}. Expected OVWeightQuantizationConfig or OVQuantizationConfig."
-            )
-
-        output_dir = Path(save_directory) if save_directory is not None else self._ort_model_path.parent
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        output_name = self._ort_model_path.name
-        output_file = output_dir / output_name
-        onnx.save(quantized_model, str(output_file))
-        logger.info(f"Saved quantized ONNX model to: {output_file}")
-
-    @staticmethod
-    def _materialize_transposed_initializers(onnx_model):
-        """
-        Folds Transpose nodes fed by initializers into new initializer tensors.
-
-        Some ONNX graphs expose MatMul weights via Transpose(initializer) node outputs.
-        NNCF ONNX weight compression expects weight tensors to be initializers, so we
-        materialize such transposes ahead of quantization.
-        """
-        import onnx
-        from onnx import numpy_helper
-
-        init_by_name = {init.name: init for init in onnx_model.graph.initializer}
-        removable_nodes = []
-        new_initializers = []
-
-        for node in onnx_model.graph.node:
-            if node.op_type != "Transpose" or len(node.input) != 1 or len(node.output) != 1:
-                continue
-
-            src_name = node.input[0]
-            dst_name = node.output[0]
-            src_init = init_by_name.get(src_name)
-            if src_init is None:
-                continue
-
-            perm = None
-            for attr in node.attribute:
-                if attr.name == "perm":
-                    perm = list(attr.ints)
-                    break
-
-            src_array = numpy_helper.to_array(src_init)
-            if perm is None:
-                perm = list(reversed(range(src_array.ndim)))
-            dst_array = np.transpose(src_array, axes=perm)
-
-            dst_init = numpy_helper.from_array(dst_array, name=dst_name)
-            new_initializers.append(dst_init)
-            removable_nodes.append(node)
-
-        if new_initializers:
-            onnx_model.graph.initializer.extend(new_initializers)
-            for node in removable_nodes:
-                onnx_model.graph.node.remove(node)
-            logger.info(
-                "Materialized %d Transpose(initializer) nodes into ONNX initializers for quantization.",
-                len(new_initializers),
-            )
-
-        return onnx_model
+        ov_quantizer = IntelOVQuantizer.from_pretrained(
+            self._ort_model_path,
+            seed=self.seed,
+            trust_remote_code=self.trust_remote_code,
+        )
+        ov_quantizer.quantize(
+            calibration_dataset=calibration_dataset,
+            ov_config=ov_config,
+            save_directory=save_directory,
+            file_name=self._ort_model_path.name,
+            **kwargs,
+        )
 
     def get_model_info(self) -> Dict[str, Any]:
         """
